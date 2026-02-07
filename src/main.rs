@@ -218,6 +218,9 @@ impl Language {
 
     fn command(self) -> (&'static str, &'static [&'static str]) {
         match self {
+            #[cfg(windows)]
+            Self::Python => ("python", &[]),
+            #[cfg(unix)]
             Self::Python => ("python3", &[]),
             Self::Bash => ("bash", &["--noprofile", "--norc"]),
         }
@@ -229,6 +232,25 @@ impl Language {
             Self::Bash => "bash",
         }
     }
+}
+
+fn fallback_python_bin(lang: Language, bin: &str) -> Option<&'static str> {
+    if !matches!(lang, Language::Python) {
+        return None;
+    }
+    #[cfg(windows)]
+    {
+        if bin == "python" {
+            return Some("py");
+        }
+    }
+    #[cfg(unix)]
+    {
+        if bin == "python3" {
+            return Some("python");
+        }
+    }
+    None
 }
 
 struct Sandbox {
@@ -438,28 +460,35 @@ impl Sandbox {
         #[cfg(not(target_os = "linux"))]
         let use_bwrap = false;
 
-        let mut command = if use_bwrap {
+        let make_command = |bin: &str| {
+            if use_bwrap {
             #[cfg(target_os = "linux")]
             {
                 let script_in_sandbox = Path::new("/work").join(lang.file_name());
-                build_bwrap_command(&self.sandbox_dir, &script_in_sandbox, bin, args)
+                return build_bwrap_command(&self.sandbox_dir, &script_in_sandbox, bin, args);
             }
             #[cfg(not(target_os = "linux"))]
             {
                 unreachable!("bwrap is only supported on Linux");
             }
-        } else {
+            } else {
             let mut cmd = Command::new(bin);
             cmd.args(args)
                 .arg(&script_path)
-                .current_dir(&self.sandbox_dir)
-                .env_clear()
-                .env("PATH", "/usr/bin:/bin")
-                .env("HOME", &self.sandbox_dir)
-                .env("LANG", "C")
-                .env("LC_ALL", "C");
-            cmd
+                .current_dir(&self.sandbox_dir);
+            #[cfg(unix)]
+            {
+                cmd.env_clear()
+                    .env("PATH", "/usr/bin:/bin")
+                    .env("HOME", &self.sandbox_dir)
+                    .env("LANG", "C")
+                    .env("LC_ALL", "C");
+            }
+            return cmd;
         };
+        };
+
+        let mut command = make_command(bin);
 
         command
             .stdin(Stdio::null())
@@ -471,9 +500,41 @@ impl Sandbox {
             apply_unix_restrictions(&mut command, &self.config)?;
         }
 
-        let mut child = command
-            .spawn()
-            .map_err(|e| format!("Cannot spawn process: {e}"))?;
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    if let Some(fallback_bin) = fallback_python_bin(lang, bin) {
+                        let mut retry = make_command(fallback_bin);
+                        retry
+                            .stdin(Stdio::null())
+                            .stdout(Stdio::piped())
+                            .stderr(Stdio::piped());
+                        #[cfg(unix)]
+                        {
+                            apply_unix_restrictions(&mut retry, &self.config)?;
+                        }
+                        match retry.spawn() {
+                            Ok(child) => child,
+                            Err(e) => {
+                                if e.kind() == std::io::ErrorKind::NotFound {
+                                    return Err(format!(
+                                        "Cannot spawn process: {e}. Tried interpreter: {bin}, fallback: {fallback_bin}. Install Python or ensure the interpreter is on PATH (on Windows, the `py` launcher is often available).",
+                                    ));
+                                }
+                                return Err(format!("Cannot spawn process: {e}"));
+                            }
+                        }
+                    } else {
+                        return Err(format!(
+                            "Cannot spawn process: {e}. Interpreter not found: {bin}. Install Python or ensure the interpreter is on PATH (on Windows, the `py` launcher is often available).",
+                        ));
+                    }
+                } else {
+                    return Err(format!("Cannot spawn process: {e}"));
+                }
+            }
+        };
 
         #[cfg(windows)]
         let _job_guard = apply_windows_restrictions(&child, &self.config)?;
@@ -1020,6 +1081,7 @@ fn run_server(mgr: Arc<Mutex<Manager>>, stop: Arc<AtomicBool>) -> io::Result<()>
     listener.set_nonblocking(true)?;
 
     println!("coocon daemon {VERSION} listening on 127.0.0.1:{PORT}");
+    eprintln!("warning: running on Windows without VM-grade isolation; use only for trusted code.");
 
     while !stop.load(Ordering::SeqCst) {
         match listener.accept() {
@@ -1066,6 +1128,8 @@ fn run_server(mgr: Arc<Mutex<Manager>>, stop: Arc<AtomicBool>) -> io::Result<()>
     listener.set_nonblocking(true)?;
 
     println!("coocon daemon {VERSION} listening on {SOCKET_PATH}");
+    #[cfg(target_os = "macos")]
+    eprintln!("warning: running on macOS without VM-grade isolation; use only for trusted code.");
 
     while !stop.load(Ordering::SeqCst) {
         match listener.accept() {
