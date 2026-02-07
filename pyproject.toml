@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "coocon"
+version = "1.0.0"
+description = "Secure sandbox for running untrusted code"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+
+[project.scripts]
+coocon = "coocon:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["coocon*"]
