@@ -1,6 +1,11 @@
 # Coocon
 
-Coocon is a **secure execution platform** for running untrusted code locally with strong defaults, clean UX, and an agent‑friendly API.
+Coocon is a **hardened local code runner** for executing snippets with predictable limits, clean UX, and an agent‑friendly API.
+
+**Security expectations**
+- Coocon reduces risk but does not provide VM‑grade isolation.
+- Best‑effort isolation on Windows/macOS; strongest isolation on Linux with `bubblewrap`.
+- Do not run hostile, multi‑tenant, or high‑risk code without an external sandbox (container or microVM).
 
 It ships as:
 - **Rust daemon** (execution engine)
@@ -8,7 +13,7 @@ It ships as:
 
 ## Why Coocon
 
-- You need **safe-by-default** code execution without spinning up heavy infra
+- You need **limit‑enforced** code execution without spinning up heavy infra
 - You want **predictable limits** (CPU/memory/output)
 - You need a **simple CLI** for humans *and* a JSON API for agents
 
@@ -122,7 +127,7 @@ coocon run "print('hello')" --profile safe --policy policy.json
 
 - No shell interpolation for user code
 - Ephemeral per-sandbox workspace under `/tmp/coocon`
-- Cleared environment for child processes
+- Cleared environment for child processes (Unix). On Windows, the environment is inherited to keep interpreters discoverable.
 - Per-execution limits on Unix:
   - memory (`RLIMIT_AS`)
   - CPU time (`RLIMIT_CPU`)
@@ -135,7 +140,7 @@ coocon run "print('hello')" --profile safe --policy policy.json
 
 ## Important limitation
 
-Coocon is a hardened local runner, **not yet a VM‑grade isolation boundary**.
+Coocon is a hardened local runner, **not a VM‑grade isolation boundary**.
 Strict mode requires Linux + `bubblewrap`. On WSL/macOS/Windows, only best‑effort isolation is available.
 For hostile multi‑tenant workloads, combine with container or microVM isolation.
 
