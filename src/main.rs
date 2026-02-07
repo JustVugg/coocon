@@ -659,11 +659,16 @@ fn apply_windows_restrictions(child: &std::process::Child, config: &SandboxConfi
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::FALSE;
     use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
+        AssignProcessToJobObject, SetInformationJobObject,
         JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
         JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_JOB_MEMORY,
         JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
     };
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateJobObjectW(lpJobAttributes: *const std::ffi::c_void, lpName: *const u16) -> isize;
+    }
 
     let job = unsafe { CreateJobObjectW(std::ptr::null_mut(), std::ptr::null()) };
     if job == 0 {
