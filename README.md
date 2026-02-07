@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="coocon.png" alt="PolyMCP Logo" width="500"/>
+  <img src="coocon_logo.png" alt="PolyMCP Logo" width="500"/>
 </p>
 
 Coocon is a **hardened local code runner** for executing snippets with predictable limits, clean UX, and an agent‑friendly API.
