@@ -277,7 +277,7 @@ fn detect_capabilities() -> Capabilities {
         let strong_isolation = !is_wsl && has_bwrap();
         Capabilities {
             hard_limits: true,
-            network_isolation: false,
+            network_isolation: strong_isolation, // <--- MODIFICATO: se c'è bwrap, possiamo isolare la rete
             strong_isolation,
             is_wsl,
         }
@@ -461,17 +461,23 @@ impl Sandbox {
         let use_bwrap = false;
 
         let make_command = |bin: &str| {
-            if use_bwrap {
+        if use_bwrap {
             #[cfg(target_os = "linux")]
             {
                 let script_in_sandbox = Path::new("/work").join(lang.file_name());
-                return build_bwrap_command(&self.sandbox_dir, &script_in_sandbox, bin, args);
+                return build_bwrap_command(
+                    &self.sandbox_dir,
+                    &script_in_sandbox,
+                    bin,
+                    args,
+                    self.config.network, // <-- PASSA IL FLAG RETE
+                );
             }
             #[cfg(not(target_os = "linux"))]
             {
                 unreachable!("bwrap is only supported on Linux");
             }
-            } else {
+        } else {
             let mut cmd = Command::new(bin);
             cmd.args(args)
                 .arg(&script_path)
@@ -485,8 +491,8 @@ impl Sandbox {
                     .env("LC_ALL", "C");
             }
             return cmd;
-        };
-        };
+        }
+    };
 
         let mut command = make_command(bin);
 
@@ -791,36 +797,38 @@ fn build_bwrap_command(
     script_in_sandbox: &Path,
     bin: &str,
     args: &[&str],
+    allow_network: bool,
 ) -> Command {
     let mut command = Command::new("bwrap");
+
     command
         .arg("--die-with-parent")
-        .arg("--new-session")
-        .arg("--unshare-all")
-        .arg("--proc")
-        .arg("/proc")
-        .arg("--dev")
-        .arg("/dev")
-        .arg("--tmpfs")
-        .arg("/tmp")
-        .arg("--bind")
-        .arg(sandbox_dir)
-        .arg("/work")
-        .arg("--chdir")
-        .arg("/work")
+        .arg("--new-session");
+
+    if allow_network {
+        // Isola tutto tranne la rete
+        command
+            .arg("--unshare-user-try")
+            .arg("--unshare-ipc")
+            .arg("--unshare-pid")
+            .arg("--unshare-uts")
+            .arg("--unshare-cgroup-try");
+    } else {
+        // Isola tutto compresa la rete
+        command.arg("--unshare-all");
+    }
+
+    command
+        .arg("--proc").arg("/proc")
+        .arg("--dev").arg("/dev")
+        .arg("--tmpfs").arg("/tmp")
+        .arg("--bind").arg(sandbox_dir).arg("/work")
+        .arg("--chdir").arg("/work")
         .arg("--clearenv")
-        .arg("--setenv")
-        .arg("PATH")
-        .arg("/usr/bin:/bin")
-        .arg("--setenv")
-        .arg("HOME")
-        .arg("/work")
-        .arg("--setenv")
-        .arg("LANG")
-        .arg("C")
-        .arg("--setenv")
-        .arg("LC_ALL")
-        .arg("C");
+        .arg("--setenv").arg("PATH").arg("/usr/bin:/bin")
+        .arg("--setenv").arg("HOME").arg("/work")
+        .arg("--setenv").arg("LANG").arg("C")
+        .arg("--setenv").arg("LC_ALL").arg("C");
 
     add_ro_bind_if_exists(&mut command, "/usr");
     add_ro_bind_if_exists(&mut command, "/bin");
@@ -839,7 +847,6 @@ fn build_bwrap_command(
 
     command
 }
-
 fn kill_child(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
@@ -943,7 +950,7 @@ fn validate_policy_support(config: &SandboxConfig, policy: &ExecutionPolicy) -> 
 }
 
 struct Manager {
-    sandboxes: HashMap<String, Sandbox>,
+    sandboxes: HashMap<String, Arc<Mutex<Sandbox>>>,
 }
 
 impl Manager {
@@ -958,24 +965,25 @@ impl Manager {
         if self.sandboxes.contains_key(&name) {
             return Err(format!("'{name}' already exists"));
         }
-
         let sandbox = Sandbox::new(config)?;
-        self.sandboxes.insert(name.clone(), sandbox);
+        self.sandboxes.insert(name.clone(), Arc::new(Mutex::new(sandbox)));
         Ok(name)
     }
 
-    fn execute(&mut self, name: &str, code: &str, lang: &str) -> Result<ExecutionResult, String> {
-        self.sandboxes
-            .get_mut(name)
-            .ok_or_else(|| format!("'{name}' not found"))?
-            .execute(code, lang)
+    fn get(&self, name: &str) -> Option<Arc<Mutex<Sandbox>>> {
+        self.sandboxes.get(name).cloned()
     }
 
-    fn execute_file(&mut self, name: &str, content: &str, filename: &str) -> Result<ExecutionResult, String> {
-        self.sandboxes
-            .get_mut(name)
-            .ok_or_else(|| format!("'{name}' not found"))?
-            .execute_file(content, filename)
+    fn execute(&self, name: &str, code: &str, lang: &str) -> Result<ExecutionResult, String> {
+        let sandbox = self.get(name).ok_or_else(|| format!("'{name}' not found"))?;
+        let mut sb = sandbox.lock().unwrap();
+        sb.execute(code, lang)
+    }
+
+    fn execute_file(&self, name: &str, content: &str, filename: &str) -> Result<ExecutionResult, String> {
+        let sandbox = self.get(name).ok_or_else(|| format!("'{name}' not found"))?;
+        let mut sb = sandbox.lock().unwrap();
+        sb.execute_file(content, filename)
     }
 
     fn destroy(&mut self, name: &str) -> Result<(), String> {
@@ -986,7 +994,13 @@ impl Manager {
     }
 
     fn list(&self) -> Vec<SandboxInfo> {
-        self.sandboxes.values().map(|s| s.info()).collect()
+        self.sandboxes
+            .values()
+            .map(|arc| {
+                let sb = arc.lock().unwrap();
+                sb.info()
+            })
+            .collect()
     }
 }
 
@@ -996,22 +1010,39 @@ fn handle(req: Request, mgr: &Arc<Mutex<Manager>>, stop: &Arc<AtomicBool>) -> Re
             Ok(name) => Response::Created { name },
             Err(e) => Response::Error { message: e },
         },
-        Request::Execute {
-            name,
-            code,
-            language,
-        } => match mgr.lock().unwrap().execute(&name, &code, &language) {
-            Ok(r) => Response::Executed(r),
-            Err(e) => Response::Error { message: e },
-        },
-        Request::ExecuteFile {
-            name,
-            content,
-            filename,
-        } => match mgr.lock().unwrap().execute_file(&name, &content, &filename) {
-            Ok(r) => Response::Executed(r),
-            Err(e) => Response::Error { message: e },
-        },
+
+        // === ESECUZIONE SBLOCCATA ===
+        Request::Execute { name, code, language } => {
+            let sandbox = {
+                let mgr_guard = mgr.lock().unwrap();
+                match mgr_guard.get(&name) {
+                    Some(sb) => sb,
+                    None => return Response::Error { message: format!("'{name}' not found") },
+                }
+            }; // lock del Manager rilasciato qui
+            let mut sb = sandbox.lock().unwrap();
+            match sb.execute(&code, &language) {
+                Ok(r) => Response::Executed(r),
+                Err(e) => Response::Error { message: e },
+            }
+        }
+
+        Request::ExecuteFile { name, content, filename } => {
+            let sandbox = {
+                let mgr_guard = mgr.lock().unwrap();
+                match mgr_guard.get(&name) {
+                    Some(sb) => sb,
+                    None => return Response::Error { message: format!("'{name}' not found") },
+                }
+            };
+            let mut sb = sandbox.lock().unwrap();
+            match sb.execute_file(&content, &filename) {
+                Ok(r) => Response::Executed(r),
+                Err(e) => Response::Error { message: e },
+            }
+        }
+        // =============================
+
         Request::Destroy { name } => match mgr.lock().unwrap().destroy(&name) {
             Ok(_) => Response::Destroyed { name },
             Err(e) => Response::Error { message: e },
@@ -1073,6 +1104,35 @@ fn parse_request_line(line: &str) -> Result<Request, String> {
     serde_json::from_str(line).map_err(|e| format!("Invalid JSON request: {e}"))
 }
 
+fn read_bounded_line<R: Read>(reader: &mut BufReader<R>) -> Result<String, String> {
+    const MAX_LEN: usize = 1024 * 1024; // 1 MiB
+    let mut buf = Vec::with_capacity(256);
+
+    loop {
+        if buf.len() >= MAX_LEN {
+            return Err("Request too large".to_string());
+        }
+        let mut byte = [0u8; 1];
+        match reader.read_exact(&mut byte) {
+            Ok(()) => {
+                buf.push(byte[0]);
+                if byte[0] == b'\n' {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                if buf.is_empty() {
+                    return Err("Empty request".to_string());
+                }
+                break;
+            }
+            Err(e) => return Err(format!("Read error: {e}")),
+        }
+    }
+
+    String::from_utf8(buf).map_err(|e| format!("Invalid UTF-8: {e}"))
+}
+
 #[cfg(windows)]
 fn run_server(mgr: Arc<Mutex<Manager>>, stop: Arc<AtomicBool>) -> io::Result<()> {
     use std::net::TcpListener;
@@ -1095,10 +1155,10 @@ fn run_server(mgr: Arc<Mutex<Manager>>, stop: Arc<AtomicBool>) -> io::Result<()>
                         Err(_) => return,
                     });
 
-                    let mut line = String::new();
-                    if reader.read_line(&mut line).is_err() {
-                        return;
-                    }
+                    let line = match read_bounded_line(&mut reader) {
+                    Ok(l) => l,
+                    Err(_) => return,
+                    };
 
                     let response = match parse_request_line(&line) {
                         Ok(req) => handle(req, &m, &s),
